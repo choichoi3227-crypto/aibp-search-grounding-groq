@@ -1,0 +1,7 @@
+name = "aibp-search-grounding-groq"
+main = "worker-groq.js"
+compatibility_date = "2026-07-29"
+
+# 배포 후 아래 두 개를 반드시 등록하세요:
+#   wrangler secret put GROQ_API_KEY        # https://console.groq.com/keys 에서 발급 (무료, 카드 불필요)
+#   wrangler secret put AIBP_SHARED_SECRET  # 임의의 긴 랜덤 문자열 (워드프레스 쪽 요청 헤더와 동일해야 함)
