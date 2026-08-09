@@ -71,6 +71,11 @@ const MAX_SNIPPET_CHARS    = 300;   // 검색 결과 각 항목의 본문 스니
 const MAX_SOURCE_LINES     = 8;     // 2단계 프롬프트에 포함할 출처 개수
 const MAX_RESEARCH_PAYLOAD_CHARS = 12000; // 2단계 Groq 요청 바디 전체에 대한 최종 안전장치(문자 수 기준)
 
+// 배포 확인용 버전 마커 — 응답의 "worker_version" 필드로 노출된다.
+// 이 값이 바뀌어 보이면 최신 코드가 실제로 배포된 것이고, 예전 값이 보이면
+// 캐시되었거나 재배포가 안 된 것이다.
+const WORKER_VERSION = '2026-08-09-413fix-2';
+
 // 이 Worker를 호출할 수 있는 출처를 제한하고 싶다면 워드프레스 도메인을 넣으세요.
 // 비워두면(빈 배열) Origin 검사는 생략하고 X-AIBP-Secret 인증만 적용합니다.
 const ALLOWED_ORIGINS = []; // 예: ['https://your-wordpress-site.com']
@@ -97,6 +102,52 @@ export default {
   async fetch(request, env, ctx) {
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: corsHeaders() });
+    }
+
+    // ── 진단용 엔드포인트: GET /debug-groq ──
+    // Worker의 다른 로직을 전혀 거치지 않고, Groq API에 아주 짧고 안전한
+    // 요청 하나만 직접 보내서 원본 응답(상태코드/에러 바디)을 그대로 반환한다.
+    // 413이 코드 문제가 아니라 Groq API 키/계정 문제인지 확인하기 위한 용도.
+    // (API 키는 앞 4자리·길이만 노출하고 전체는 절대 노출하지 않는다.)
+    const urlForDebug = new URL(request.url);
+    if (request.method === 'GET' && urlForDebug.pathname === '/debug-groq') {
+      const authHeader = request.headers.get('X-AIBP-Secret') || '';
+      if (env.AIBP_SHARED_SECRET && authHeader !== env.AIBP_SHARED_SECRET) {
+        return jsonResponse({ error: '인증 실패 (X-AIBP-Secret 헤더 확인 필요)' }, 401);
+      }
+      if (!env.GROQ_API_KEY) {
+        return jsonResponse({ error: 'GROQ_API_KEY가 설정되지 않았습니다.' }, 500);
+      }
+      const keyInfo = {
+        key_length: env.GROQ_API_KEY.length,
+        key_prefix: env.GROQ_API_KEY.slice(0, 4),
+        key_has_whitespace: /\s/.test(env.GROQ_API_KEY),
+      };
+      const tinyBody = JSON.stringify({
+        model: 'groq/compound',
+        messages: [ { role: 'user', content: '안녕' } ],
+      });
+      let debugRes;
+      try {
+        debugRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + env.GROQ_API_KEY,
+          },
+          body: tinyBody,
+        });
+      } catch (e) {
+        return jsonResponse({ worker_version: WORKER_VERSION, key_info: keyInfo, fetch_error: String(e) }, 502);
+      }
+      const debugBodyText = await debugRes.text().catch(() => '');
+      return jsonResponse({
+        worker_version: WORKER_VERSION,
+        key_info: keyInfo,
+        sent_body_bytes: tinyBody.length,
+        groq_status: debugRes.status,
+        groq_body: debugBodyText.slice(0, 1000),
+      }, 200);
     }
 
     if (request.method !== 'POST' && request.method !== 'GET') {
@@ -162,11 +213,13 @@ export default {
         research: data.research,
         source: 'groq-compound',
         fetched_at: new Date().toISOString(),
+        worker_version: WORKER_VERSION,
       }, 200);
     } catch (err) {
       return jsonResponse({
         error: '검색 중 오류가 발생했습니다: ' + (err && err.message ? err.message : String(err)),
         query,
+        worker_version: WORKER_VERSION,
       }, 502);
     }
   },
@@ -200,7 +253,7 @@ async function searchAndResearchWithGroq(query, maxResults, country, wantResearc
     searchPayload.search_settings = searchSettings;
   }
 
-  const searchData = await callGroq(endpoint, searchPayload, env, FETCH_TIMEOUT_MS);
+  const searchData = await callGroq(endpoint, searchPayload, env, FETCH_TIMEOUT_MS, '1단계(검색)');
   const searchMessage = searchData && searchData.choices && searchData.choices[0] && searchData.choices[0].message
     ? searchData.choices[0].message
     : {};
@@ -338,7 +391,7 @@ ${sourceLines || '(검색 결과 없음 — 보유 지식으로 최대한 정확
 
   let researchData;
   try {
-    researchData = await callGroq(endpoint, researchPayload, env, FETCH_TIMEOUT_MS);
+    researchData = await callGroq(endpoint, researchPayload, env, FETCH_TIMEOUT_MS, '2단계(조사)');
   } catch (e) {
     // 2단계(JSON 조사)가 실패해도 1단계 검색 결과는 이미 확보했으므로,
     // research는 안전한 기본값으로 채워서 반환한다 (호출 자체를 실패시키지 않음).
@@ -390,9 +443,11 @@ function normalizeHex(value, fallback) {
   return /^#[0-9a-fA-F]{6}$/.test(v) ? v : fallback;
 }
 
-async function callGroq(endpoint, payload, env, timeoutMs) {
+async function callGroq(endpoint, payload, env, timeoutMs, stageLabel) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  const bodyStr = JSON.stringify(payload);
 
   let res;
   try {
@@ -402,7 +457,7 @@ async function callGroq(endpoint, payload, env, timeoutMs) {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ' + env.GROQ_API_KEY,
       },
-      body: JSON.stringify(payload),
+      body: bodyStr,
       signal: controller.signal,
     });
   } finally {
@@ -411,7 +466,8 @@ async function callGroq(endpoint, payload, env, timeoutMs) {
 
   if (!res.ok) {
     const errBody = await res.text().catch(() => '');
-    throw new Error('Groq API 응답 실패: HTTP ' + res.status + ' ' + errBody.slice(0, 300));
+    const label = stageLabel ? `[${stageLabel}, 요청 바디 ${bodyStr.length}자] ` : '';
+    throw new Error(label + 'Groq API 응답 실패: HTTP ' + res.status + ' ' + errBody.slice(0, 300));
   }
 
   return res.json();
