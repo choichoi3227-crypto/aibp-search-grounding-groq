@@ -65,16 +65,16 @@ const FETCH_TIMEOUT_MS    = 18000;
 // 어느 한쪽(워드프레스 쪽 topic이 비정상적으로 길게 들어오거나, 1단계 검색
 // 응답 summary가 예상보다 길게 나오는 경우 등)이 무제한으로 커지더라도
 // Groq 호출 자체는 항상 작고 안전한 크기를 유지하도록 하는 것이 목적이다.
-const MAX_QUERY_CHARS      = 500;   // 사용자가 넘긴 검색 주제(query) 최대 길이
-const MAX_SUMMARY_CHARS    = 4000;  // 1단계 검색 요약(summary)을 2단계 프롬프트에 재사용할 때 최대 길이
-const MAX_SNIPPET_CHARS    = 300;   // 검색 결과 각 항목의 본문 스니펫 최대 길이
-const MAX_SOURCE_LINES     = 8;     // 2단계 프롬프트에 포함할 출처 개수
-const MAX_RESEARCH_PAYLOAD_CHARS = 12000; // 2단계 Groq 요청 바디 전체에 대한 최종 안전장치(문자 수 기준)
+const MAX_QUERY_CHARS      = 300;   // 사용자가 넘긴 검색 주제(query) 최대 길이
+const MAX_SUMMARY_CHARS    = 1500;  // 1단계 검색 요약(summary)을 2단계 프롬프트에 재사용할 때 최대 길이
+const MAX_SNIPPET_CHARS    = 150;   // 검색 결과 각 항목의 본문 스니펫 최대 길이
+const MAX_SOURCE_LINES     = 5;     // 2단계 프롬프트에 포함할 출처 개수
+const MAX_RESEARCH_PAYLOAD_CHARS = 7000; // 2단계 Groq 요청 바디 전체에 대한 최종 안전장치(문자 수 기준)
 
 // 배포 확인용 버전 마커 — 응답의 "worker_version" 필드로 노출된다.
 // 이 값이 바뀌어 보이면 최신 코드가 실제로 배포된 것이고, 예전 값이 보이면
 // 캐시되었거나 재배포가 안 된 것이다.
-const WORKER_VERSION = '2026-08-09-413fix-2';
+const WORKER_VERSION = '2026-08-09-413fix-3-compact';
 
 // 이 Worker를 호출할 수 있는 출처를 제한하고 싶다면 워드프레스 도메인을 넣으세요.
 // 비워두면(빈 배열) Origin 검사는 생략하고 X-AIBP-Secret 인증만 적용합니다.
@@ -305,66 +305,33 @@ async function buildResearchJson(query, summary, results, country, env) {
     })
     .join('\n');
 
-  const researchPrompt = `당신은 한국 미디어·문화·서비스·브랜드에 정통한 비주얼 콘텐츠 전문가입니다.
-아래 키워드와 검색 결과를 바탕으로, 최고 품질 이미지 생성에 필요한 정보를 추출하세요.
-반드시 아래 검색 결과(출처 및 상세 내용 포함)를 최우선 근거로 삼아 최신·정확한 사실에
-기반해 조사하고, 구체적 디테일(색상, 형태, 최근 이슈, 캠페인, 시각적 특징 등)을 반영하세요.
+  const researchPrompt = `한국 비주얼 콘텐츠 전문가로서, 아래 키워드와 검색 결과를 근거로 이미지 생성용 정보를 JSON으로 추출하세요.
 
 [키워드]: ${query}
+[검색 요약]: ${safeSummary || '(없음)'}
+[출처]: ${sourceLines || '(없음 — 보유 지식 활용)'}
 
-[검색 요약]
-${safeSummary || '(요약 없음)'}
+【브랜드 오역 방지 — 독립 단어로 등장할 때만 적용, 다른 단어의 일부 음절이면 무시】
+알약(앱)→보안SW / 토스(앱)→핀테크 / 카카오(브랜드)→IT기업 / 네이버→검색엔진 / 배민→배달앱 / 당근(브랜드)→중고거래앱 / 쿠팡→이커머스 / 지코→K-pop아티스트(zico)
+"예약/계약/약속/약국" 등은 "알약"과 무관, 의약품 이미지 연상 금지.
 
-[검색 결과 상세]
-${sourceLines || '(검색 결과 없음 — 보유 지식으로 최대한 정확하게 조사하세요)'}
+【지침】
+- 브랜드 로고·워드마크·실제 UI를 재현하지 말고 해당 카테고리를 대표하는 독창적 그래픽 은유로 표현(상표권 보호)
+- visual_context/hero_shot/key_visuals에 사람·얼굴·인물·실루엣 절대 금지(특정 인물이 주제인 경우 제외)
+- 색상은 배경과 대비되는 텍스트색+액센트색을 HEX로 지정
 
-【오역 방지 — 한국 고유 브랜드/서비스명 필수 확인】
-아래는 "단어가 다른 뜻을 연상시키지만 실제로는 특정 브랜드·서비스를 가리키는" 사례입니다.
-반드시 브랜드명 전체가 정확히, 독립된 단어로 키워드에 등장할 때만 적용하세요. 그 글자가
-다른 단어의 일부 음절로만 우연히 포함된 경우(예: "사전예약"의 "약")는 이 목록과 무관하니
-무시하고 원래 문맥 그대로 해석하세요.
-- "알약" (앱 이름 전체로 등장할 때) → 한국 보안SW (일반 의약품 알약이 아님)
-- "토스" (앱 이름으로 등장할 때) → 핀테크앱 (동사 "던지다"가 아님)
-- "카카오" (브랜드로 등장할 때) → IT대기업 (열매 카카오가 아님)
-- "네이버" → 검색엔진 (이웃neighbor이 아님)
-- "배민" → 배달앱
-- "당근" (브랜드로 등장할 때) → 중고거래앱 (채소 당근이 아님)
-- "쿠팡" → 이커머스
-- "지코" → K-pop 아티스트 (zico)
-⚠️ 특히 주의: "예약", "계약", "약속", "약국" 등 "약"을 포함하는 일반 한국어 단어는 위
-"알약" 항목과 전혀 무관합니다. 절대로 알약/영양제/의약품 이미지를 연상하지 마세요.
-
-【분석 항목】
-1. 이 키워드가 한국 독자에게 실제로 의미하는 것
-2. 최고 품질 이미지로 표현할 때 사용해야 할 구체적 시각 요소 — 단, 키워드가 특정
-   상용 앱/브랜드(예: 카카오톡, 알약, 토스 등)를 가리키더라도 그 브랜드의 실제
-   로고·워드마크·정확한 화면 UI를 그대로 재현하라는 요소는 절대 포함하지 말고,
-   해당 서비스 카테고리(메신저/보안SW/핀테크 등)를 대표하는 독창적이고 일반화된
-   그래픽 은유로 표현할 것(상표권·저작권 보호)
-3. 가장 임팩트 있는 단일 핵심 장면/오브젝트 (특정 브랜드 로고·UI를 베끼지 않는 선에서)
-4. 색상 분위기 (따뜻한/차가운/중성, 대표 색상)
-5. 잘못 그릴 경우 발생할 오류
-6. 이 키워드의 감정적 톤 (긴급함/신뢰감/설렘/차분함/역동적/고급스러움 중 가장 가까운 것)
-7. 텍스트 오버레이에 실제로 사용할 구체적 색상 — 배경과 확실히 대비되는 하나의 메인
-   텍스트 색과, 포인트로 쓸 액센트 색을 HEX 코드로 지정
-
-⚠️ 매우 중요 — 인물 배제: visual_context, hero_shot, key_visuals 어디에도 사람/인물/
-얼굴/모델을 시각 요소로 넣지 마세요 (예: "여성", "남성", "모델", "인물", "person",
-"woman", "model" 등 사용 금지). 이 키워드가 특정 인물(연예인, 정치인 등) 그 자체를
-다루는 주제가 아닌 이상, 항상 사물·아이콘·장면 등 비인물 요소로만 표현하세요.
-
-아래 JSON 형식으로만 답하세요. 코드블록이나 다른 텍스트 없이 순수 JSON만 출력하세요:
+아래 JSON 형식으로만, 코드블록 없이 순수 JSON만 출력하세요:
 {
-  "actual_meaning": "실제 의미 (1문장, 정확하게)",
-  "visual_context": "이미지화 대상 (구체적 장면/오브젝트, 영문 묘사 포함)",
-  "hero_shot": "가장 임팩트 있는 단 하나의 시각 장면 (영어로)",
-  "color_mood": "색상 분위기 (영어로, 예: warm golden tones, cool tech blues)",
+  "actual_meaning": "실제 의미 (1문장)",
+  "visual_context": "이미지화 대상 (영문 묘사)",
+  "hero_shot": "핵심 시각 장면 (영어)",
+  "color_mood": "색상 분위기 (영어)",
   "key_visuals": ["영어 시각요소1", "영어 시각요소2", "영어 시각요소3", "영어 시각요소4"],
   "category": "앱/서비스|음식|IT기술|금융|건강|교육|라이프스타일|엔터테인먼트|인물|제품|기타",
-  "wrong_interpretation": "잘못 해석 시 오류 (간결하게, 없으면 빈 문자열)",
+  "wrong_interpretation": "잘못 해석 시 오류 (간결히, 없으면 빈 문자열)",
   "emotional_tone": "urgent|trustworthy|exciting|calm|dynamic|premium 중 하나",
-  "text_color_hex": "배경과 대비되는 텍스트 메인 색상 HEX (예: #FFFFFF)",
-  "accent_color_hex": "포인트 액센트 색상 HEX (예: #FFD400)"
+  "text_color_hex": "#FFFFFF",
+  "accent_color_hex": "#FFD400"
 }`;
 
   let researchPayload = {
@@ -374,17 +341,27 @@ ${sourceLines || '(검색 결과 없음 — 보유 지식으로 최대한 정확
   };
 
   // ⚠️ 최종 안전장치: 위의 개별 길이 제한(query/summary/snippet)을 모두
-  // 적용했는데도 프롬프트 총 길이가 비정상적으로 큰 경우(예: 검색 결과
-  // 항목 수가 많거나 다국어 인코딩 등으로 예상보다 커진 경우), 413을
-  // 아예 겪지 않도록 출처 상세 내용을 통째로 제거하고 요약만으로 재구성한다.
+  // 적용했는데도 프롬프트 총 길이가 비정상적으로 큰 경우, 413을 아예
+  // 겪지 않도록 출처 상세를 제거하고 요약만으로 재구성한다.
   if (JSON.stringify(researchPayload).length > MAX_RESEARCH_PAYLOAD_CHARS) {
-    const fallbackPrompt = researchPrompt.replace(
-      /\[검색 결과 상세\][\s\S]*?(?=\n【오역 방지)/,
-      '[검색 결과 상세]\n(검색 결과가 너무 길어 생략됨 — 검색 요약만 참고)\n\n'
-    );
+    const fallbackPrompt = researchPrompt.replace(sourceLines, '(생략됨 — 요약만 참고)');
     researchPayload = {
       model: 'groq/compound',
       messages: [ { role: 'user', content: fallbackPrompt } ],
+      temperature: 0.4,
+    };
+  }
+
+  // ⚠️ 그래도 여전히 크면(극단적 케이스), 아예 최소 프롬프트로 재구성해
+  // 413을 절대 겪지 않도록 한다.
+  if (JSON.stringify(researchPayload).length > MAX_RESEARCH_PAYLOAD_CHARS) {
+    const minimalPrompt = `한국 비주얼 콘텐츠 전문가로서 아래 키워드에 대한 이미지 생성용 정보를 JSON으로 추출하세요.
+[키워드]: ${truncate(query, 200)}
+visual_context/hero_shot/key_visuals에 사람·얼굴·인물 절대 금지, 실제 브랜드 로고/UI 재현 금지.
+JSON만 출력: {"actual_meaning":"","visual_context":"","hero_shot":"","color_mood":"","key_visuals":[],"category":"","wrong_interpretation":"","emotional_tone":"dynamic","text_color_hex":"#FFFFFF","accent_color_hex":"#FFD400"}`;
+    researchPayload = {
+      model: 'groq/compound',
+      messages: [ { role: 'user', content: minimalPrompt } ],
       temperature: 0.4,
     };
   }
