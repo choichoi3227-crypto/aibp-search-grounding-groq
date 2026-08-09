@@ -53,12 +53,14 @@
 const DEFAULT_MAX_RESULTS = 8;
 const MAX_ALLOWED_RESULTS = 10;
 // ⚠️ 이 Worker는 요청 하나당 "검색"과 "조사(JSON화)" 두 번의 Groq 호출을 순차로
-// 수행한다. 워드프레스 플러그인 쪽 전체 예산이 CloudFront 등 오리진 타임아웃
-// (약 60초) 안에서 두 호출 + 그 뒤의 Gemini 프롬프트 생성까지 끝나야 하므로,
-// 각 단계별 타임아웃을 18초로 두어 최악의 경우에도 두 단계 합쳐 36초 안팎에서
-// 끝나도록 한다(검색 단계가 오래 걸리는 극단적 케이스에도 조사 단계가 실행될
-// 여유를 확보하기 위함).
-const FETCH_TIMEOUT_MS    = 18000;
+// 수행한다. 워드프레스 쪽(wp_remote_post)의 실제 콜 타임아웃은 고정 40초가
+// 아니라 남은 예산에 따라 최소 8초까지도 내려갈 수 있다(재시도 1차가 실패해
+// 시간을 많이 소모한 뒤 2차 호출의 타임아웃이 훨씬 짧아지는 식). 즉 Worker는
+// "최악의 경우 워드프레스가 8초만에 연결을 끊을 수도 있다"는 전제로 동작해야
+// 하므로, 내부에서 429/413을 만나 여러 초씩 대기하는 재시도는 오히려 역효과—
+// 워드프레스가 먼저 연결을 끊어버려 재시도 시도 자체가 낭비된다.
+// → 각 단계 타임아웃을 줄이고, 재시도 대기는 짧게, 재시도 자체도 최소화한다.
+const FETCH_TIMEOUT_MS    = 12000;
 
 // ⚠️ 413(Request Entity Too Large) 방지용 하드 캡.
 // Groq API로 보내는 요청 바디는 항상 이 값들 이하로 강제로 잘라낸다.
@@ -74,7 +76,7 @@ const MAX_RESEARCH_PAYLOAD_CHARS = 7000; // 2단계 Groq 요청 바디 전체에
 // 배포 확인용 버전 마커 — 응답의 "worker_version" 필드로 노출된다.
 // 이 값이 바뀌어 보이면 최신 코드가 실제로 배포된 것이고, 예전 값이 보이면
 // 캐시되었거나 재배포가 안 된 것이다.
-const WORKER_VERSION = '2026-08-09-413fix-6-tpm-root-cause';
+const WORKER_VERSION = '2026-08-09-413fix-7-fast-fail';
 
 // 1단계(검색)는 웹 검색 도구가 내장된 groq/compound가 반드시 필요하다.
 // 2단계(조사 JSON 생성)는 순수 텍스트 → JSON 변환 작업이라 웹 검색이 전혀
@@ -86,10 +88,14 @@ const WORKER_VERSION = '2026-08-09-413fix-6-tpm-root-cause';
 const SEARCH_MODEL   = 'groq/compound';
 const RESEARCH_MODEL = 'llama-3.3-70b-versatile';
 
-// 워드프레스 쪽이 이 Worker 응답을 최대 40초 안팎까지 기다려주므로, Worker
-// 전체 처리(검색+조사+재시도 대기 포함)는 45초를 넘기지 않도록 한다.
-// 이 값을 기준으로 재시도 대기시간의 상한을 동적으로 계산한다.
-const TOTAL_BUDGET_MS = 45000;
+// ⚠️ 워드프레스 쪽 wp_remote_post 타임아웃이 실제로는 최소 8초까지도 내려갈
+// 수 있음이 확인되었다(재시도 2차 호출에서 16초로 관측됨 — 1차 실패로 예산을
+// 많이 소모한 뒤 2차 timeout이 짧게 계산됨). 이는 Worker 응답이 그보다 느리면
+// 워드프레스가 먼저 연결을 끊는다는 뜻이므로, Worker는 절대적으로 짧고
+// 예측 가능한 시간 안에 응답을 마쳐야 한다. 내부 처리(검색+조사+재시도 대기
+// 전부 포함) 총 예산을 25초로 강하게 제한해, 어떤 상황에서도 워드프레스의
+// 최소 타임아웃(관측상 16~40초)보다 여유 있게 먼저 응답하도록 한다.
+const TOTAL_BUDGET_MS = 25000;
 
 // 이 Worker를 호출할 수 있는 출처를 제한하고 싶다면 워드프레스 도메인을 넣으세요.
 // 비워두면(빈 배열) Origin 검사는 생략하고 X-AIBP-Secret 인증만 적용합니다.
@@ -462,12 +468,14 @@ async function callGroq(endpoint, payload, env, timeoutMs, stageLabel, remaining
   // 실제 소비 토큰이 훨씬 커서 이 한도에 쉽게 걸릴 수 있다.
   // → "요청이 크다"는 문구에 속지 말고 429/413을 동일한 TPM 초과로 취급한다.
   //
-  // 재시도 대기시간은 Groq 응답 헤더(retry-after)와 본문의
-  // "try again in Xs" 문구를 최우선으로 신뢰하고, 없을 때만 기본값을 쓴다.
-  // TPM 윈도우는 통상 수 초~수십 초 단위로 리셋되므로, 예전처럼 최대 5초로
-  // 캡을 걸면 리셋 전에 재시도해 계속 같은 에러를 반복하게 된다. 남은 시간
-  // 예산이 허락하는 한 최대 20초까지는 실제로 기다린다.
-  const MAX_RETRIES = 2;
+  // ⚠️ 2026-08(413fix-7): 워드프레스 쪽 wp_remote_post 타임아웃이 실제로는
+  // 최소 8초까지도 내려갈 수 있음이 확인되어(재시도 2차 호출에서 16초로
+  // 관측), Worker가 재시도 대기로 시간을 오래 끌면 워드프레스가 먼저 연결을
+  // 끊어버려 재시도 자체가 무의미해진다. 재시도는 "실패를 빠르게 확정"하는
+  // 정도로만 1회 허용하고, 대기시간도 짧게(최대 4초) 제한한다. 재시도로도
+  // 실패하면 즉시 명확한 에러를 반환해 워드프레스 쪽 재시도(최대 2회)가
+  // 정상적으로 여러 번 시도할 시간을 벌어준다.
+  const MAX_RETRIES = 1;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const controller = new AbortController();
@@ -501,15 +509,16 @@ async function callGroq(endpoint, payload, env, timeoutMs, stageLabel, remaining
     const errBody = await res.text().catch(() => '');
     const isRateLimited = res.status === 429 || res.status === 413;
 
-    if (isRateLimited && attempt < MAX_RETRIES) {
-      const waitSec = computeRetryWaitSeconds(res, errBody);
-      // 남은 시간 예산(다음 재시도 + 이후 단계 실행 시간)을 고려해, 대기가
-      // 예산을 통째로 잡아먹지 않도록만 제한한다. remainingBudgetMs가
-      // 주어지지 않은 경우(기본 호출부)에는 최대 20초까지 허용한다.
-      const capMs = typeof remainingBudgetMs === 'number'
-        ? Math.max(1000, Math.min(remainingBudgetMs - timeoutMs, 20000))
-        : 20000;
-      const waitMs = Math.min(waitSec * 1000, capMs);
+    // 대기시간은 아주 짧게만 준다(최대 4초) — 워드프레스가 훨씬 이른 시점에
+    // 연결을 끊을 수 있으므로, TPM 윈도우 리셋을 기다리는 긴 대기는 이
+    // 위치에서는 의미가 없다(어차피 응답을 못 받고 끊긴다). 남은 예산이
+    // 재시도 1회조차 감당할 수 없을 만큼 적으면(500ms 미만) 재시도를 포기하고
+    // 바로 에러를 던져 워드프레스 쪽 재시도(최대 2회)가 시간을 낭비하지
+    // 않도록 한다.
+    const remaining = typeof remainingBudgetMs === 'number' ? remainingBudgetMs - timeoutMs : 8000;
+    const waitMs = Math.min(4000, remaining);
+
+    if (isRateLimited && attempt < MAX_RETRIES && waitMs >= 500) {
       await new Promise((resolve) => setTimeout(resolve, waitMs));
       continue;
     }
@@ -520,21 +529,6 @@ async function callGroq(endpoint, payload, env, timeoutMs, stageLabel, remaining
       : '';
     throw new Error(label + 'Groq API 응답 실패: HTTP ' + res.status + ' ' + errBody.slice(0, 500) + hint);
   }
-}
-
-// Groq 429/413 응답에서 "얼마나 기다려야 하는지"를 최대한 정확히 읽어낸다.
-// 우선순위: 1) Retry-After 헤더  2) 본문의 "try again in Xs" 문구  3) 기본값(8초).
-function computeRetryWaitSeconds(res, errBody) {
-  const retryAfterHeader = res.headers && res.headers.get ? res.headers.get('retry-after') : null;
-  if (retryAfterHeader) {
-    const n = parseFloat(retryAfterHeader);
-    if (!isNaN(n) && n > 0) return n + 0.3;
-  }
-  const match = errBody.match(/try again in ([\d.]+)s/i);
-  if (match) {
-    return parseFloat(match[1]) + 0.3;
-  }
-  return 8;
 }
 
 function byteLengthUtf8(str) {
