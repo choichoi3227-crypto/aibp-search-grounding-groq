@@ -74,7 +74,7 @@ const MAX_RESEARCH_PAYLOAD_CHARS = 7000; // 2단계 Groq 요청 바디 전체에
 // 배포 확인용 버전 마커 — 응답의 "worker_version" 필드로 노출된다.
 // 이 값이 바뀌어 보이면 최신 코드가 실제로 배포된 것이고, 예전 값이 보이면
 // 캐시되었거나 재배포가 안 된 것이다.
-const WORKER_VERSION = '2026-08-09-413fix-3-compact';
+const WORKER_VERSION = '2026-08-09-413fix-4-searchsettings-ab';
 
 // 이 Worker를 호출할 수 있는 출처를 제한하고 싶다면 워드프레스 도메인을 넣으세요.
 // 비워두면(빈 배열) Origin 검사는 생략하고 X-AIBP-Secret 인증만 적용합니다.
@@ -123,30 +123,44 @@ export default {
         key_prefix: env.GROQ_API_KEY.slice(0, 4),
         key_has_whitespace: /\s/.test(env.GROQ_API_KEY),
       };
-      const tinyBody = JSON.stringify({
+
+      // 테스트 A: search_settings 없이 (성공했던 케이스)
+      const bodyA = JSON.stringify({
         model: 'groq/compound',
         messages: [ { role: 'user', content: '안녕' } ],
       });
-      let debugRes;
-      try {
-        debugRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + env.GROQ_API_KEY,
-          },
-          body: tinyBody,
-        });
-      } catch (e) {
-        return jsonResponse({ worker_version: WORKER_VERSION, key_info: keyInfo, fetch_error: String(e) }, 502);
+      // 테스트 B: search_settings.country 포함 (1단계 검색과 동일한 형태 —
+      // 실제로 413이 나는 것으로 의심되는 조합)
+      const bodyB = JSON.stringify({
+        model: 'groq/compound',
+        messages: [ { role: 'user', content: '안녕' } ],
+        search_settings: { country: 'south korea' },
+      });
+
+      async function tryGroq(body) {
+        try {
+          const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer ' + env.GROQ_API_KEY,
+            },
+            body,
+          });
+          const text = await r.text().catch(() => '');
+          return { sent_body_bytes: body.length, status: r.status, body: text.slice(0, 500) };
+        } catch (e) {
+          return { sent_body_bytes: body.length, fetch_error: String(e) };
+        }
       }
-      const debugBodyText = await debugRes.text().catch(() => '');
+
+      const [resultA, resultB] = await Promise.all([ tryGroq(bodyA), tryGroq(bodyB) ]);
+
       return jsonResponse({
         worker_version: WORKER_VERSION,
         key_info: keyInfo,
-        sent_body_bytes: tinyBody.length,
-        groq_status: debugRes.status,
-        groq_body: debugBodyText.slice(0, 1000),
+        test_A_no_search_settings: resultA,
+        test_B_with_search_settings: resultB,
       }, 200);
     }
 
