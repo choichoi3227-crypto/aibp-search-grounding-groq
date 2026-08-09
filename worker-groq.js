@@ -74,7 +74,22 @@ const MAX_RESEARCH_PAYLOAD_CHARS = 7000; // 2단계 Groq 요청 바디 전체에
 // 배포 확인용 버전 마커 — 응답의 "worker_version" 필드로 노출된다.
 // 이 값이 바뀌어 보이면 최신 코드가 실제로 배포된 것이고, 예전 값이 보이면
 // 캐시되었거나 재배포가 안 된 것이다.
-const WORKER_VERSION = '2026-08-09-413fix-5-ratelimit-retry';
+const WORKER_VERSION = '2026-08-09-413fix-6-tpm-root-cause';
+
+// 1단계(검색)는 웹 검색 도구가 내장된 groq/compound가 반드시 필요하다.
+// 2단계(조사 JSON 생성)는 순수 텍스트 → JSON 변환 작업이라 웹 검색이 전혀
+// 필요 없는데도 지금까지는 똑같이 groq/compound를 썼다. groq/compound는
+// 내부적으로 여러 서브모델을 태우는 무거운 에이전틱 모델이라 TPM(분당 토큰)
+// 소비가 훨씬 크고, 이게 "요청 바디는 짧은데도 413(TPM 초과)이 뜨는" 현상의
+// 근본 원인이었다. 2단계는 훨씬 가벼운 일반 모델로 분리해 TPM 소비 자체를
+// 줄인다(속도도 더 빠르다).
+const SEARCH_MODEL   = 'groq/compound';
+const RESEARCH_MODEL = 'llama-3.3-70b-versatile';
+
+// 워드프레스 쪽이 이 Worker 응답을 최대 40초 안팎까지 기다려주므로, Worker
+// 전체 처리(검색+조사+재시도 대기 포함)는 45초를 넘기지 않도록 한다.
+// 이 값을 기준으로 재시도 대기시간의 상한을 동적으로 계산한다.
+const TOTAL_BUDGET_MS = 45000;
 
 // 이 Worker를 호출할 수 있는 출처를 제한하고 싶다면 워드프레스 도메인을 넣으세요.
 // 비워두면(빈 배열) Origin 검사는 생략하고 X-AIBP-Secret 인증만 적용합니다.
@@ -218,8 +233,10 @@ export default {
     query = truncate(query, MAX_QUERY_CHARS);
     maxResults = Math.min(Math.max(1, maxResults), MAX_ALLOWED_RESULTS);
 
+    const deadlineTs = Date.now() + TOTAL_BUDGET_MS;
+
     try {
-      const data = await searchAndResearchWithGroq(query, maxResults, country, wantResearch, env);
+      const data = await searchAndResearchWithGroq(query, maxResults, country, wantResearch, env, deadlineTs);
       return jsonResponse({
         query,
         summary: data.summary,
@@ -245,15 +262,15 @@ export default {
  *        이미지 프롬프트 생성에 필요한 구조화된 JSON을 만들도록 요청.
  * (필요 없으면 wantResearch=false로 2단계를 건너뛸 수 있다.)
  * ──────────────────────────────────────────────────────────── */
-async function searchAndResearchWithGroq(query, maxResults, country, wantResearch, env) {
+async function searchAndResearchWithGroq(query, maxResults, country, wantResearch, env, deadlineTs) {
   const endpoint = 'https://api.groq.com/openai/v1/chat/completions';
 
   const searchSettings = {};
   if (country) searchSettings.country = country;
 
-  // ── 1단계: 검색 + 요약 (기존 로직과 동일) ──
+  // ── 1단계: 검색 + 요약 (웹 검색 도구가 필요하므로 groq/compound 사용) ──
   const searchPayload = {
-    model: 'groq/compound',
+    model: SEARCH_MODEL,
     messages: [
       {
         role: 'user',
@@ -267,7 +284,7 @@ async function searchAndResearchWithGroq(query, maxResults, country, wantResearc
     searchPayload.search_settings = searchSettings;
   }
 
-  const searchData = await callGroq(endpoint, searchPayload, env, FETCH_TIMEOUT_MS, '1단계(검색)');
+  const searchData = await callGroq(endpoint, searchPayload, env, FETCH_TIMEOUT_MS, '1단계(검색)', deadlineTs - Date.now());
   const searchMessage = searchData && searchData.choices && searchData.choices[0] && searchData.choices[0].message
     ? searchData.choices[0].message
     : {};
@@ -295,7 +312,7 @@ async function searchAndResearchWithGroq(query, maxResults, country, wantResearc
   }
 
   // ── 2단계: 위 검색 결과를 근거로 이미지 프롬프트용 구조화 JSON 조사 ──
-  const research = await buildResearchJson(query, summary, results, country, env);
+  const research = await buildResearchJson(query, summary, results, country, env, deadlineTs);
 
   return { summary, results, research };
 }
@@ -304,7 +321,7 @@ async function searchAndResearchWithGroq(query, maxResults, country, wantResearc
  * 여기서는 별도 검색 도구를 다시 붙이지 않고(이미 1단계에서 검색을 마쳤으므로),
  * 위에서 얻은 근거 텍스트만 프롬프트에 넣어 순수 텍스트 생성으로 JSON을 뽑는다.
  * 이렇게 하면 groq/compound가 다시 웹 검색을 반복 실행하지 않아 응답 속도가 빨라진다. */
-async function buildResearchJson(query, summary, results, country, env) {
+async function buildResearchJson(query, summary, results, country, env, deadlineTs) {
   const endpoint = 'https://api.groq.com/openai/v1/chat/completions';
 
   // ⚠️ 413 방지: 1단계 groq/compound가 예상보다 긴 요약을 반환하는 경우에도
@@ -349,7 +366,7 @@ async function buildResearchJson(query, summary, results, country, env) {
 }`;
 
   let researchPayload = {
-    model: 'groq/compound',
+    model: RESEARCH_MODEL,
     messages: [ { role: 'user', content: researchPrompt } ],
     temperature: 0.4,
   };
@@ -360,7 +377,7 @@ async function buildResearchJson(query, summary, results, country, env) {
   if (JSON.stringify(researchPayload).length > MAX_RESEARCH_PAYLOAD_CHARS) {
     const fallbackPrompt = researchPrompt.replace(sourceLines, '(생략됨 — 요약만 참고)');
     researchPayload = {
-      model: 'groq/compound',
+      model: RESEARCH_MODEL,
       messages: [ { role: 'user', content: fallbackPrompt } ],
       temperature: 0.4,
     };
@@ -374,7 +391,7 @@ async function buildResearchJson(query, summary, results, country, env) {
 visual_context/hero_shot/key_visuals에 사람·얼굴·인물 절대 금지, 실제 브랜드 로고/UI 재현 금지.
 JSON만 출력: {"actual_meaning":"","visual_context":"","hero_shot":"","color_mood":"","key_visuals":[],"category":"","wrong_interpretation":"","emotional_tone":"dynamic","text_color_hex":"#FFFFFF","accent_color_hex":"#FFD400"}`;
     researchPayload = {
-      model: 'groq/compound',
+      model: RESEARCH_MODEL,
       messages: [ { role: 'user', content: minimalPrompt } ],
       temperature: 0.4,
     };
@@ -382,7 +399,7 @@ JSON만 출력: {"actual_meaning":"","visual_context":"","hero_shot":"","color_m
 
   let researchData;
   try {
-    researchData = await callGroq(endpoint, researchPayload, env, FETCH_TIMEOUT_MS, '2단계(조사)');
+    researchData = await callGroq(endpoint, researchPayload, env, FETCH_TIMEOUT_MS, '2단계(조사)', deadlineTs ? deadlineTs - Date.now() : undefined);
   } catch (e) {
     // 2단계(JSON 조사)가 실패해도 1단계 검색 결과는 이미 확보했으므로,
     // research는 안전한 기본값으로 채워서 반환한다 (호출 자체를 실패시키지 않음).
@@ -434,17 +451,23 @@ function normalizeHex(value, fallback) {
   return /^#[0-9a-fA-F]{6}$/.test(v) ? v : fallback;
 }
 
-async function callGroq(endpoint, payload, env, timeoutMs, stageLabel) {
+async function callGroq(endpoint, payload, env, timeoutMs, stageLabel, remainingBudgetMs) {
   const bodyStr = JSON.stringify(payload);
 
-  // ⚠️ 2026-08 발견: 이 조직의 Groq 무료 티어 TPM(분당 토큰) 한도가 낮아
-  // (예: 8000 TPM), groq/compound가 내부적으로 태우는 서브모델
-  // (openai/gpt-oss-120b 등)이 한도를 넘기면 429(Rate limit)가 발생한다.
-  // 이 429가 클라이언트 쪽에는 종종 413으로 보이는 방식으로 표면화되는
-  // 사례가 확인되어, 429/413 두 경우 모두 "잠시 대기 후 1회 재시도"로
-  // 완화한다. 재시도로도 실패하면 사용자에게 원인(레이트리밋)을 명확히
-  // 알 수 있도록 에러 메시지에 원본 상태코드와 본문을 그대로 남긴다.
-  const MAX_RETRIES = 1;
+  // ⚠️ 2026-08 확인: Groq는 "요청 바디가 실제로 큰 경우"뿐 아니라, 모델의
+  // TPM(분당 토큰) 한도를 초과했을 때도 HTTP 413("Request too large ...
+  // tokens per minute (TPM): Limit X, Requested Y")을 반환한다(429와 함께
+  // 사실상 같은 rate-limit 계열 에러). 요청 바디가 219자처럼 매우 짧아도
+  // groq/compound처럼 내부적으로 여러 서브모델·검색 도구를 태우는 모델은
+  // 실제 소비 토큰이 훨씬 커서 이 한도에 쉽게 걸릴 수 있다.
+  // → "요청이 크다"는 문구에 속지 말고 429/413을 동일한 TPM 초과로 취급한다.
+  //
+  // 재시도 대기시간은 Groq 응답 헤더(retry-after)와 본문의
+  // "try again in Xs" 문구를 최우선으로 신뢰하고, 없을 때만 기본값을 쓴다.
+  // TPM 윈도우는 통상 수 초~수십 초 단위로 리셋되므로, 예전처럼 최대 5초로
+  // 캡을 걸면 리셋 전에 재시도해 계속 같은 에러를 반복하게 된다. 남은 시간
+  // 예산이 허락하는 한 최대 20초까지는 실제로 기다린다.
+  const MAX_RETRIES = 2;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const controller = new AbortController();
@@ -461,6 +484,12 @@ async function callGroq(endpoint, payload, env, timeoutMs, stageLabel) {
         body: bodyStr,
         signal: controller.signal,
       });
+    } catch (fetchErr) {
+      clearTimeout(timer);
+      // fetch 자체가 실패(네트워크/타임아웃)한 경우는 재시도해도 대부분
+      // 같은 이유로 실패하므로 바로 원인을 알 수 있게 던진다.
+      const label = stageLabel ? `[${stageLabel}] ` : '';
+      throw new Error(label + 'Groq API 호출 실패(네트워크/타임아웃): ' + (fetchErr && fetchErr.message ? fetchErr.message : String(fetchErr)));
     } finally {
       clearTimeout(timer);
     }
@@ -473,20 +502,43 @@ async function callGroq(endpoint, payload, env, timeoutMs, stageLabel) {
     const isRateLimited = res.status === 429 || res.status === 413;
 
     if (isRateLimited && attempt < MAX_RETRIES) {
-      // 에러 본문에서 "try again in 16.0125s" 형태의 대기 시간을 최대한 읽어보고,
-      // 없으면 기본 3초 대기 후 재시도한다(전체 예산 초과를 피하기 위해 최대 12초로 제한).
-      const match = errBody.match(/try again in ([\d.]+)s/i);
-      const waitSec = match ? Math.min(5, parseFloat(match[1]) + 0.3) : 2;
-      await new Promise((resolve) => setTimeout(resolve, waitSec * 1000));
+      const waitSec = computeRetryWaitSeconds(res, errBody);
+      // 남은 시간 예산(다음 재시도 + 이후 단계 실행 시간)을 고려해, 대기가
+      // 예산을 통째로 잡아먹지 않도록만 제한한다. remainingBudgetMs가
+      // 주어지지 않은 경우(기본 호출부)에는 최대 20초까지 허용한다.
+      const capMs = typeof remainingBudgetMs === 'number'
+        ? Math.max(1000, Math.min(remainingBudgetMs - timeoutMs, 20000))
+        : 20000;
+      const waitMs = Math.min(waitSec * 1000, capMs);
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
       continue;
     }
 
-    const label = stageLabel ? `[${stageLabel}, 요청 바디 ${bodyStr.length}자] ` : '';
+    const label = stageLabel ? `[${stageLabel}, 요청 바디 ${bodyStr.length}자, ${byteLengthUtf8(bodyStr)}바이트] ` : '';
     const hint = isRateLimited
-      ? ' — Groq 무료 티어의 분당 토큰 한도(TPM)를 초과했습니다. https://console.groq.com/settings/billing 에서 Dev Tier로 업그레이드하거나, 잠시 후 다시 시도해주세요.'
+      ? ' — Groq 무료 티어의 분당 토큰 한도(TPM)를 초과했습니다(요청 바디 크기 문제가 아닙니다). https://console.groq.com/settings/billing 에서 Dev Tier로 업그레이드하거나, 잠시 후 다시 시도해주세요.'
       : '';
-    throw new Error(label + 'Groq API 응답 실패: HTTP ' + res.status + ' ' + errBody.slice(0, 300) + hint);
+    throw new Error(label + 'Groq API 응답 실패: HTTP ' + res.status + ' ' + errBody.slice(0, 500) + hint);
   }
+}
+
+// Groq 429/413 응답에서 "얼마나 기다려야 하는지"를 최대한 정확히 읽어낸다.
+// 우선순위: 1) Retry-After 헤더  2) 본문의 "try again in Xs" 문구  3) 기본값(8초).
+function computeRetryWaitSeconds(res, errBody) {
+  const retryAfterHeader = res.headers && res.headers.get ? res.headers.get('retry-after') : null;
+  if (retryAfterHeader) {
+    const n = parseFloat(retryAfterHeader);
+    if (!isNaN(n) && n > 0) return n + 0.3;
+  }
+  const match = errBody.match(/try again in ([\d.]+)s/i);
+  if (match) {
+    return parseFloat(match[1]) + 0.3;
+  }
+  return 8;
+}
+
+function byteLengthUtf8(str) {
+  return new TextEncoder().encode(str).length;
 }
 
 /* ── 공통 유틸 ── */
