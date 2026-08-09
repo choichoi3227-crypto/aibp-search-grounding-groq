@@ -60,6 +60,17 @@ const MAX_ALLOWED_RESULTS = 10;
 // 여유를 확보하기 위함).
 const FETCH_TIMEOUT_MS    = 18000;
 
+// ⚠️ 413(Request Entity Too Large) 방지용 하드 캡.
+// Groq API로 보내는 요청 바디는 항상 이 값들 이하로 강제로 잘라낸다.
+// 어느 한쪽(워드프레스 쪽 topic이 비정상적으로 길게 들어오거나, 1단계 검색
+// 응답 summary가 예상보다 길게 나오는 경우 등)이 무제한으로 커지더라도
+// Groq 호출 자체는 항상 작고 안전한 크기를 유지하도록 하는 것이 목적이다.
+const MAX_QUERY_CHARS      = 500;   // 사용자가 넘긴 검색 주제(query) 최대 길이
+const MAX_SUMMARY_CHARS    = 4000;  // 1단계 검색 요약(summary)을 2단계 프롬프트에 재사용할 때 최대 길이
+const MAX_SNIPPET_CHARS    = 300;   // 검색 결과 각 항목의 본문 스니펫 최대 길이
+const MAX_SOURCE_LINES     = 8;     // 2단계 프롬프트에 포함할 출처 개수
+const MAX_RESEARCH_PAYLOAD_CHARS = 12000; // 2단계 Groq 요청 바디 전체에 대한 최종 안전장치(문자 수 기준)
+
 // 이 Worker를 호출할 수 있는 출처를 제한하고 싶다면 워드프레스 도메인을 넣으세요.
 // 비워두면(빈 배열) Origin 검사는 생략하고 X-AIBP-Secret 인증만 적용합니다.
 const ALLOWED_ORIGINS = []; // 예: ['https://your-wordpress-site.com']
@@ -136,6 +147,10 @@ export default {
     if (!query) {
       return jsonResponse({ error: 'query 파라미터가 비어 있습니다.' }, 400);
     }
+    // ⚠️ 413 방지: 호출 측(워드프레스 등)이 실수로 매우 긴 텍스트(예: 글 전체
+    // 프롬프트)를 query로 넘기더라도, 여기서 즉시 안전한 길이로 잘라 이후
+    // Groq 호출들이 절대 과도하게 커지지 않도록 한다.
+    query = truncate(query, MAX_QUERY_CHARS);
     maxResults = Math.min(Math.max(1, maxResults), MAX_ALLOWED_RESULTS);
 
     try {
@@ -225,11 +240,15 @@ async function searchAndResearchWithGroq(query, maxResults, country, wantResearc
 async function buildResearchJson(query, summary, results, country, env) {
   const endpoint = 'https://api.groq.com/openai/v1/chat/completions';
 
+  // ⚠️ 413 방지: 1단계 groq/compound가 예상보다 긴 요약을 반환하는 경우에도
+  // 2단계 프롬프트가 과도하게 커지지 않도록 상한을 둔다.
+  const safeSummary = truncate(summary, MAX_SUMMARY_CHARS);
+
   const sourceLines = results
-    .slice(0, 8)
+    .slice(0, MAX_SOURCE_LINES)
     .map((r) => {
-      const snippet = (r.content || '').slice(0, 300);
-      return `- ${r.title || ''} (${r.url || ''})\n  ${snippet}`;
+      const snippet = truncate(r.content || '', MAX_SNIPPET_CHARS);
+      return `- ${truncate(r.title || '', 150)} (${truncate(r.url || '', 300)})\n  ${snippet}`;
     })
     .join('\n');
 
@@ -241,7 +260,7 @@ async function buildResearchJson(query, summary, results, country, env) {
 [키워드]: ${query}
 
 [검색 요약]
-${summary || '(요약 없음)'}
+${safeSummary || '(요약 없음)'}
 
 [검색 결과 상세]
 ${sourceLines || '(검색 결과 없음 — 보유 지식으로 최대한 정확하게 조사하세요)'}
@@ -295,11 +314,27 @@ ${sourceLines || '(검색 결과 없음 — 보유 지식으로 최대한 정확
   "accent_color_hex": "포인트 액센트 색상 HEX (예: #FFD400)"
 }`;
 
-  const researchPayload = {
+  let researchPayload = {
     model: 'groq/compound',
     messages: [ { role: 'user', content: researchPrompt } ],
     temperature: 0.4,
   };
+
+  // ⚠️ 최종 안전장치: 위의 개별 길이 제한(query/summary/snippet)을 모두
+  // 적용했는데도 프롬프트 총 길이가 비정상적으로 큰 경우(예: 검색 결과
+  // 항목 수가 많거나 다국어 인코딩 등으로 예상보다 커진 경우), 413을
+  // 아예 겪지 않도록 출처 상세 내용을 통째로 제거하고 요약만으로 재구성한다.
+  if (JSON.stringify(researchPayload).length > MAX_RESEARCH_PAYLOAD_CHARS) {
+    const fallbackPrompt = researchPrompt.replace(
+      /\[검색 결과 상세\][\s\S]*?(?=\n【오역 방지)/,
+      '[검색 결과 상세]\n(검색 결과가 너무 길어 생략됨 — 검색 요약만 참고)\n\n'
+    );
+    researchPayload = {
+      model: 'groq/compound',
+      messages: [ { role: 'user', content: fallbackPrompt } ],
+      temperature: 0.4,
+    };
+  }
 
   let researchData;
   try {
@@ -383,6 +418,13 @@ async function callGroq(endpoint, payload, env, timeoutMs) {
 }
 
 /* ── 공통 유틸 ── */
+// 문자열을 최대 길이로 안전하게 자른다(문자 단위, 서로게이트 페어는 고려하지
+// 않지만 이 용도로는 충분함 — 잘려도 요청 실패보다 낫다).
+function truncate(str, maxChars) {
+  if (typeof str !== 'string') return '';
+  return str.length > maxChars ? str.slice(0, maxChars) + '…' : str;
+}
+
 function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
