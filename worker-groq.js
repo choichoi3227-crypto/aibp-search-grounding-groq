@@ -74,7 +74,7 @@ const MAX_RESEARCH_PAYLOAD_CHARS = 7000; // 2단계 Groq 요청 바디 전체에
 // 배포 확인용 버전 마커 — 응답의 "worker_version" 필드로 노출된다.
 // 이 값이 바뀌어 보이면 최신 코드가 실제로 배포된 것이고, 예전 값이 보이면
 // 캐시되었거나 재배포가 안 된 것이다.
-const WORKER_VERSION = '2026-08-09-413fix-4-searchsettings-ab';
+const WORKER_VERSION = '2026-08-09-413fix-5-ratelimit-retry';
 
 // 이 Worker를 호출할 수 있는 출처를 제한하고 싶다면 워드프레스 도메인을 넣으세요.
 // 비워두면(빈 배열) Origin 검사는 생략하고 X-AIBP-Secret 인증만 적용합니다.
@@ -435,33 +435,58 @@ function normalizeHex(value, fallback) {
 }
 
 async function callGroq(endpoint, payload, env, timeoutMs, stageLabel) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
   const bodyStr = JSON.stringify(payload);
 
-  let res;
-  try {
-    res = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + env.GROQ_API_KEY,
-      },
-      body: bodyStr,
-      signal: controller.signal,
-    });
-  } finally {
-    clearTimeout(timer);
-  }
+  // ⚠️ 2026-08 발견: 이 조직의 Groq 무료 티어 TPM(분당 토큰) 한도가 낮아
+  // (예: 8000 TPM), groq/compound가 내부적으로 태우는 서브모델
+  // (openai/gpt-oss-120b 등)이 한도를 넘기면 429(Rate limit)가 발생한다.
+  // 이 429가 클라이언트 쪽에는 종종 413으로 보이는 방식으로 표면화되는
+  // 사례가 확인되어, 429/413 두 경우 모두 "잠시 대기 후 1회 재시도"로
+  // 완화한다. 재시도로도 실패하면 사용자에게 원인(레이트리밋)을 명확히
+  // 알 수 있도록 에러 메시지에 원본 상태코드와 본문을 그대로 남긴다.
+  const MAX_RETRIES = 1;
 
-  if (!res.ok) {
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    let res;
+    try {
+      res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + env.GROQ_API_KEY,
+        },
+        body: bodyStr,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (res.ok) {
+      return res.json();
+    }
+
     const errBody = await res.text().catch(() => '');
-    const label = stageLabel ? `[${stageLabel}, 요청 바디 ${bodyStr.length}자] ` : '';
-    throw new Error(label + 'Groq API 응답 실패: HTTP ' + res.status + ' ' + errBody.slice(0, 300));
-  }
+    const isRateLimited = res.status === 429 || res.status === 413;
 
-  return res.json();
+    if (isRateLimited && attempt < MAX_RETRIES) {
+      // 에러 본문에서 "try again in 16.0125s" 형태의 대기 시간을 최대한 읽어보고,
+      // 없으면 기본 3초 대기 후 재시도한다(전체 예산 초과를 피하기 위해 최대 12초로 제한).
+      const match = errBody.match(/try again in ([\d.]+)s/i);
+      const waitSec = match ? Math.min(5, parseFloat(match[1]) + 0.3) : 2;
+      await new Promise((resolve) => setTimeout(resolve, waitSec * 1000));
+      continue;
+    }
+
+    const label = stageLabel ? `[${stageLabel}, 요청 바디 ${bodyStr.length}자] ` : '';
+    const hint = isRateLimited
+      ? ' — Groq 무료 티어의 분당 토큰 한도(TPM)를 초과했습니다. https://console.groq.com/settings/billing 에서 Dev Tier로 업그레이드하거나, 잠시 후 다시 시도해주세요.'
+      : '';
+    throw new Error(label + 'Groq API 응답 실패: HTTP ' + res.status + ' ' + errBody.slice(0, 300) + hint);
+  }
 }
 
 /* ── 공통 유틸 ── */
