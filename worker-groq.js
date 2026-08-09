@@ -1,46 +1,86 @@
 /**
  * AIBP Search Grounding Worker (Groq 기반)
  * ------------------------------------------------------------------
- * 역할: Gemini API 내장 그라운딩(tools: google_search)이 무료 티어에서
- *       429(quota exceeded)로 사실상 완전히 막혀 있는 문제를 우회하기 위해,
- *       검색은 Groq의 groq/compound 모델(Tavily 기반 웹 검색 내장)이 대신
- *       수행하고, 정리된 결과를 JSON으로 반환한다.
- *       워드프레스 플러그인은 이 결과를 Gemini 프롬프트 앞부분에 텍스트로
- *       삽입해서, Gemini 쪽 요청에는 더 이상 google_search 툴을 쓰지 않는다.
+ * 역할: 키워드에 대한 "주제 조사"를 이 Worker가 전부 끝까지 수행한다.
+ *       Groq의 groq/compound 모델(Tavily 기반 웹 검색 내장)이 최신 웹
+ *       정보를 검색하고, 그 검색 결과를 바탕으로 AI 이미지 프롬프트 생성에
+ *       필요한 구조화된 JSON(실제 의미, 시각화 대상, 색상 분위기 등)까지
+ *       이 Worker 안에서 직접 만들어 반환한다.
  *
- * 왜 Groq인가:
- *   - groq/compound 모델은 자체적으로 웹 검색(Tavily 제공)을 수행하고
- *     search_results(title/url/content/score)를 그대로 반환해준다.
- *   - 무료 티어 한도: RPM 30 / RPD 250 / TPM 70K (2026-07 기준, Groq 공식 문서)
- *     → Gemini 그라운딩이 사실상 0에 가까웠던 것과 비교해 훨씬 여유롭다.
- *   - 별도의 검색 전용 API 키가 필요 없고, Groq API 키 하나로 끝난다.
+ * ⚠️ 2026-08 개편 (2차): 기존에는 이 Worker가 "검색 결과 요약 텍스트"만
+ *    돌려주고, 워드프레스 쪽에서 그 텍스트를 다시 Gemini에 넘겨 Gemini가
+ *    조사(actual_meaning/visual_context/hero_shot 등 JSON)를 수행했다.
+ *    이제는 그 조사 단계 전체를 이 Worker가 맡는다 — Gemini는 더 이상
+ *    "주제가 무엇을 의미하는가"를 조사하지 않고, 이 Worker가 이미 조사해
+ *    구조화해준 결과를 받아 "이미지 프롬프트 문장 작성"만 담당한다.
+ *    (워드프레스 플러그인 측 Phase A의 Gemini 호출은 완전히 제거됨)
  *
  * 엔드포인트: POST /  (또는 GET /?q=검색어)
- * 요청 바디(JSON): { "query": "검색어", "max_results": 5 }
+ * 요청 바디(JSON): { "query": "검색어", "max_results": 8, "country": "south korea" }
  * 요청 헤더: X-AIBP-Secret: <공유비밀키>  (Worker Secret으로 등록해야 함)
- * 응답(JSON):
+ *
+ * 응답(JSON) — 검색 요약/원본 결과에 더해 구조화된 조사 필드를 함께 반환:
  *   {
  *     "query": "검색어",
  *     "summary": "Groq이 검색 결과를 종합해 정리한 텍스트",
- *     "results": [
- *       { "title": "...", "url": "...", "content": "...", "score": 0.81 },
- *       ...
- *     ],
+ *     "results": [ { "title", "url", "content", "score" }, ... ],
+ *     "research": {
+ *       "actual_meaning": "이 키워드가 한국 독자에게 실제로 의미하는 것 (1문장)",
+ *       "visual_context": "이미지화 대상 (구체적 장면/오브젝트, 영문)",
+ *       "hero_shot": "가장 임팩트 있는 단 하나의 시각 장면 (영문)",
+ *       "color_mood": "색상 분위기 (영문, 예: warm golden tones)",
+ *       "key_visuals": ["영문 시각요소1", "영문 시각요소2", "영문 시각요소3", "영문 시각요소4"],
+ *       "category": "앱/서비스|음식|IT기술|금융|건강|교육|라이프스타일|엔터테인먼트|인물|제품|기타",
+ *       "wrong_interpretation": "잘못 해석 시 발생할 오류 (간결, 없으면 빈 문자열)",
+ *       "emotional_tone": "urgent|trustworthy|exciting|calm|dynamic|premium 중 하나",
+ *       "text_color_hex": "#FFFFFF",
+ *       "accent_color_hex": "#FFD400"
+ *     },
  *     "source": "groq-compound",
- *     "fetched_at": "2026-07-29T12:00:00.000Z"
+ *     "fetched_at": "2026-08-09T12:00:00.000Z"
  *   }
+ *
+ * research 필드 생성에 실패한 경우(모델이 JSON을 못 만든 경우 등)에도
+ * summary/results는 최대한 채워서 반환하고, research는 최소한의 안전한
+ * 기본값(빈 문자열/기본 톤)으로 채워 절대 필드 자체가 누락되지 않게 한다.
+ * 워드프레스 쪽에서 "research 필드가 아예 없다"는 상황을 겪지 않도록
+ * 이 Worker가 항상 유효한 구조를 보장하는 것이 핵심 계약이다.
  *
  * 배포 전 필수: wrangler secret put GROQ_API_KEY
  *              wrangler secret put AIBP_SHARED_SECRET
  */
 
-const DEFAULT_MAX_RESULTS = 5;
+const DEFAULT_MAX_RESULTS = 8;
 const MAX_ALLOWED_RESULTS = 10;
-const FETCH_TIMEOUT_MS    = 20000; // Groq 검색+합성은 단순 스크래핑보다 시간이 더 걸릴 수 있음
+// ⚠️ 이 Worker는 요청 하나당 "검색"과 "조사(JSON화)" 두 번의 Groq 호출을 순차로
+// 수행한다. 워드프레스 플러그인 쪽 전체 예산이 CloudFront 등 오리진 타임아웃
+// (약 60초) 안에서 두 호출 + 그 뒤의 Gemini 프롬프트 생성까지 끝나야 하므로,
+// 각 단계별 타임아웃을 18초로 두어 최악의 경우에도 두 단계 합쳐 36초 안팎에서
+// 끝나도록 한다(검색 단계가 오래 걸리는 극단적 케이스에도 조사 단계가 실행될
+// 여유를 확보하기 위함).
+const FETCH_TIMEOUT_MS    = 18000;
 
 // 이 Worker를 호출할 수 있는 출처를 제한하고 싶다면 워드프레스 도메인을 넣으세요.
 // 비워두면(빈 배열) Origin 검사는 생략하고 X-AIBP-Secret 인증만 적용합니다.
 const ALLOWED_ORIGINS = []; // 예: ['https://your-wordpress-site.com']
+
+// research 필드가 비어있거나 모델이 실패했을 때 사용할 안전한 기본값.
+// 여기의 값들은 "조사 실패를 감추기 위한 그럴듯한 추측"이 아니라, 단지 필드
+// 누락으로 워드프레스 쪽 JSON 파싱이 깨지지 않도록 하는 최소한의 중립값이다.
+function emptyResearch(query) {
+  return {
+    actual_meaning: query,
+    visual_context: '',
+    hero_shot: '',
+    color_mood: '',
+    key_visuals: [],
+    category: '기타',
+    wrong_interpretation: '',
+    emotional_tone: 'dynamic',
+    text_color_hex: '#FFFFFF',
+    accent_color_hex: '#FFD400',
+  };
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -73,6 +113,7 @@ export default {
     let query = '';
     let maxResults = DEFAULT_MAX_RESULTS;
     let country = ''; // 예: 'south korea' — 한국 콘텐츠 우선 검색하려면 지정
+    let wantResearch = true; // 구조화된 조사 JSON도 함께 만들지 여부 (기본 true)
 
     try {
       if (request.method === 'GET') {
@@ -80,11 +121,13 @@ export default {
         query = (url.searchParams.get('q') || '').trim();
         maxResults = parseInt(url.searchParams.get('max_results') || '', 10) || DEFAULT_MAX_RESULTS;
         country = (url.searchParams.get('country') || '').trim();
+        wantResearch = url.searchParams.get('research') !== '0';
       } else {
         const body = await request.json();
         query = (body.query || '').trim();
         maxResults = parseInt(body.max_results, 10) || DEFAULT_MAX_RESULTS;
         country = (body.country || '').trim();
+        wantResearch = body.research !== false && body.research !== 0;
       }
     } catch (e) {
       return jsonResponse({ error: '요청 본문을 파싱할 수 없습니다 (JSON 형식 확인).' }, 400);
@@ -96,11 +139,12 @@ export default {
     maxResults = Math.min(Math.max(1, maxResults), MAX_ALLOWED_RESULTS);
 
     try {
-      const data = await searchWithGroqCompound(query, maxResults, country, env);
+      const data = await searchAndResearchWithGroq(query, maxResults, country, wantResearch, env);
       return jsonResponse({
         query,
         summary: data.summary,
         results: data.results,
+        research: data.research,
         source: 'groq-compound',
         fetched_at: new Date().toISOString(),
       }, 200);
@@ -114,33 +158,206 @@ export default {
 };
 
 /* ────────────────────────────────────────────────────────────
- * Groq groq/compound 모델 호출 — 내장 웹 검색(Tavily) 자동 수행.
- * 모델이 알아서 검색이 필요한지 판단해 검색을 실행하고, 최종 종합 답변과
- * 원본 검색 결과(search_results)를 함께 반환한다.
+ * 1단계: groq/compound 모델로 웹 검색(Tavily 내장) 수행.
+ * 2단계: 검색 결과를 바탕으로 groq/compound 모델에게 다시 한번,
+ *        이미지 프롬프트 생성에 필요한 구조화된 JSON을 만들도록 요청.
+ * (필요 없으면 wantResearch=false로 2단계를 건너뛸 수 있다.)
  * ──────────────────────────────────────────────────────────── */
-async function searchWithGroqCompound(query, maxResults, country, env) {
+async function searchAndResearchWithGroq(query, maxResults, country, wantResearch, env) {
   const endpoint = 'https://api.groq.com/openai/v1/chat/completions';
 
   const searchSettings = {};
   if (country) searchSettings.country = country;
 
-  const payload = {
+  // ── 1단계: 검색 + 요약 (기존 로직과 동일) ──
+  const searchPayload = {
     model: 'groq/compound',
     messages: [
       {
         role: 'user',
         content:
           '다음 주제에 대해 최신 웹 정보를 검색하고, 핵심 사실 위주로 간결하게 정리해줘. ' +
-          '블로그 글 작성에 참고할 자료 수집이 목적이므로 과장 없이 사실만 나열해줘.\n\n주제: ' + query,
+          '블로그 글/이미지 제작에 참고할 자료 수집이 목적이므로 과장 없이 사실만 나열해줘.\n\n주제: ' + query,
       },
     ],
   };
   if (Object.keys(searchSettings).length > 0) {
-    payload.search_settings = searchSettings;
+    searchPayload.search_settings = searchSettings;
   }
 
+  const searchData = await callGroq(endpoint, searchPayload, env, FETCH_TIMEOUT_MS);
+  const searchMessage = searchData && searchData.choices && searchData.choices[0] && searchData.choices[0].message
+    ? searchData.choices[0].message
+    : {};
+
+  const summary = searchMessage.content || '';
+
+  let rawResults = [];
+  if (Array.isArray(searchMessage.executed_tools)) {
+    for (const tool of searchMessage.executed_tools) {
+      if (tool && tool.search_results && Array.isArray(tool.search_results.results)) {
+        rawResults = rawResults.concat(tool.search_results.results);
+      }
+    }
+  }
+
+  const results = rawResults.slice(0, maxResults).map((r) => ({
+    title: r.title || '',
+    url: r.url || '',
+    content: r.content || '',
+    score: typeof r.score === 'number' ? r.score : null,
+  }));
+
+  if (!wantResearch) {
+    return { summary, results, research: emptyResearch(query) };
+  }
+
+  // ── 2단계: 위 검색 결과를 근거로 이미지 프롬프트용 구조화 JSON 조사 ──
+  const research = await buildResearchJson(query, summary, results, country, env);
+
+  return { summary, results, research };
+}
+
+/* 검색 결과(summary + results)를 근거로 이미지 프롬프트 조사 JSON을 만든다.
+ * 여기서는 별도 검색 도구를 다시 붙이지 않고(이미 1단계에서 검색을 마쳤으므로),
+ * 위에서 얻은 근거 텍스트만 프롬프트에 넣어 순수 텍스트 생성으로 JSON을 뽑는다.
+ * 이렇게 하면 groq/compound가 다시 웹 검색을 반복 실행하지 않아 응답 속도가 빨라진다. */
+async function buildResearchJson(query, summary, results, country, env) {
+  const endpoint = 'https://api.groq.com/openai/v1/chat/completions';
+
+  const sourceLines = results
+    .slice(0, 8)
+    .map((r) => {
+      const snippet = (r.content || '').slice(0, 300);
+      return `- ${r.title || ''} (${r.url || ''})\n  ${snippet}`;
+    })
+    .join('\n');
+
+  const researchPrompt = `당신은 한국 미디어·문화·서비스·브랜드에 정통한 비주얼 콘텐츠 전문가입니다.
+아래 키워드와 검색 결과를 바탕으로, 최고 품질 이미지 생성에 필요한 정보를 추출하세요.
+반드시 아래 검색 결과(출처 및 상세 내용 포함)를 최우선 근거로 삼아 최신·정확한 사실에
+기반해 조사하고, 구체적 디테일(색상, 형태, 최근 이슈, 캠페인, 시각적 특징 등)을 반영하세요.
+
+[키워드]: ${query}
+
+[검색 요약]
+${summary || '(요약 없음)'}
+
+[검색 결과 상세]
+${sourceLines || '(검색 결과 없음 — 보유 지식으로 최대한 정확하게 조사하세요)'}
+
+【오역 방지 — 한국 고유 브랜드/서비스명 필수 확인】
+아래는 "단어가 다른 뜻을 연상시키지만 실제로는 특정 브랜드·서비스를 가리키는" 사례입니다.
+반드시 브랜드명 전체가 정확히, 독립된 단어로 키워드에 등장할 때만 적용하세요. 그 글자가
+다른 단어의 일부 음절로만 우연히 포함된 경우(예: "사전예약"의 "약")는 이 목록과 무관하니
+무시하고 원래 문맥 그대로 해석하세요.
+- "알약" (앱 이름 전체로 등장할 때) → 한국 보안SW (일반 의약품 알약이 아님)
+- "토스" (앱 이름으로 등장할 때) → 핀테크앱 (동사 "던지다"가 아님)
+- "카카오" (브랜드로 등장할 때) → IT대기업 (열매 카카오가 아님)
+- "네이버" → 검색엔진 (이웃neighbor이 아님)
+- "배민" → 배달앱
+- "당근" (브랜드로 등장할 때) → 중고거래앱 (채소 당근이 아님)
+- "쿠팡" → 이커머스
+- "지코" → K-pop 아티스트 (zico)
+⚠️ 특히 주의: "예약", "계약", "약속", "약국" 등 "약"을 포함하는 일반 한국어 단어는 위
+"알약" 항목과 전혀 무관합니다. 절대로 알약/영양제/의약품 이미지를 연상하지 마세요.
+
+【분석 항목】
+1. 이 키워드가 한국 독자에게 실제로 의미하는 것
+2. 최고 품질 이미지로 표현할 때 사용해야 할 구체적 시각 요소 — 단, 키워드가 특정
+   상용 앱/브랜드(예: 카카오톡, 알약, 토스 등)를 가리키더라도 그 브랜드의 실제
+   로고·워드마크·정확한 화면 UI를 그대로 재현하라는 요소는 절대 포함하지 말고,
+   해당 서비스 카테고리(메신저/보안SW/핀테크 등)를 대표하는 독창적이고 일반화된
+   그래픽 은유로 표현할 것(상표권·저작권 보호)
+3. 가장 임팩트 있는 단일 핵심 장면/오브젝트 (특정 브랜드 로고·UI를 베끼지 않는 선에서)
+4. 색상 분위기 (따뜻한/차가운/중성, 대표 색상)
+5. 잘못 그릴 경우 발생할 오류
+6. 이 키워드의 감정적 톤 (긴급함/신뢰감/설렘/차분함/역동적/고급스러움 중 가장 가까운 것)
+7. 텍스트 오버레이에 실제로 사용할 구체적 색상 — 배경과 확실히 대비되는 하나의 메인
+   텍스트 색과, 포인트로 쓸 액센트 색을 HEX 코드로 지정
+
+⚠️ 매우 중요 — 인물 배제: visual_context, hero_shot, key_visuals 어디에도 사람/인물/
+얼굴/모델을 시각 요소로 넣지 마세요 (예: "여성", "남성", "모델", "인물", "person",
+"woman", "model" 등 사용 금지). 이 키워드가 특정 인물(연예인, 정치인 등) 그 자체를
+다루는 주제가 아닌 이상, 항상 사물·아이콘·장면 등 비인물 요소로만 표현하세요.
+
+아래 JSON 형식으로만 답하세요. 코드블록이나 다른 텍스트 없이 순수 JSON만 출력하세요:
+{
+  "actual_meaning": "실제 의미 (1문장, 정확하게)",
+  "visual_context": "이미지화 대상 (구체적 장면/오브젝트, 영문 묘사 포함)",
+  "hero_shot": "가장 임팩트 있는 단 하나의 시각 장면 (영어로)",
+  "color_mood": "색상 분위기 (영어로, 예: warm golden tones, cool tech blues)",
+  "key_visuals": ["영어 시각요소1", "영어 시각요소2", "영어 시각요소3", "영어 시각요소4"],
+  "category": "앱/서비스|음식|IT기술|금융|건강|교육|라이프스타일|엔터테인먼트|인물|제품|기타",
+  "wrong_interpretation": "잘못 해석 시 오류 (간결하게, 없으면 빈 문자열)",
+  "emotional_tone": "urgent|trustworthy|exciting|calm|dynamic|premium 중 하나",
+  "text_color_hex": "배경과 대비되는 텍스트 메인 색상 HEX (예: #FFFFFF)",
+  "accent_color_hex": "포인트 액센트 색상 HEX (예: #FFD400)"
+}`;
+
+  const researchPayload = {
+    model: 'groq/compound',
+    messages: [ { role: 'user', content: researchPrompt } ],
+    temperature: 0.4,
+  };
+
+  let researchData;
+  try {
+    researchData = await callGroq(endpoint, researchPayload, env, FETCH_TIMEOUT_MS);
+  } catch (e) {
+    // 2단계(JSON 조사)가 실패해도 1단계 검색 결과는 이미 확보했으므로,
+    // research는 안전한 기본값으로 채워서 반환한다 (호출 자체를 실패시키지 않음).
+    return emptyResearch(query);
+  }
+
+  const message = researchData && researchData.choices && researchData.choices[0] && researchData.choices[0].message
+    ? researchData.choices[0].message
+    : {};
+  let text = (message.content || '').trim();
+
+  // 코드블록으로 감싸서 나오는 경우 제거
+  text = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    const m = text.match(/\{[\s\S]*\}/);
+    if (m) {
+      try { parsed = JSON.parse(m[0]); } catch (e2) { parsed = null; }
+    }
+  }
+
+  if (!parsed || typeof parsed !== 'object') {
+    return emptyResearch(query);
+  }
+
+  const base = emptyResearch(query);
+  const out = {
+    actual_meaning: typeof parsed.actual_meaning === 'string' && parsed.actual_meaning.trim() ? parsed.actual_meaning.trim() : base.actual_meaning,
+    visual_context: typeof parsed.visual_context === 'string' ? parsed.visual_context.trim() : base.visual_context,
+    hero_shot: typeof parsed.hero_shot === 'string' ? parsed.hero_shot.trim() : base.hero_shot,
+    color_mood: typeof parsed.color_mood === 'string' ? parsed.color_mood.trim() : base.color_mood,
+    key_visuals: Array.isArray(parsed.key_visuals) ? parsed.key_visuals.filter((v) => typeof v === 'string').slice(0, 6) : base.key_visuals,
+    category: typeof parsed.category === 'string' && parsed.category.trim() ? parsed.category.trim() : base.category,
+    wrong_interpretation: typeof parsed.wrong_interpretation === 'string' ? parsed.wrong_interpretation.trim() : base.wrong_interpretation,
+    emotional_tone: typeof parsed.emotional_tone === 'string' && parsed.emotional_tone.trim() ? parsed.emotional_tone.trim() : base.emotional_tone,
+    text_color_hex: normalizeHex(parsed.text_color_hex, base.text_color_hex),
+    accent_color_hex: normalizeHex(parsed.accent_color_hex, base.accent_color_hex),
+  };
+
+  return out;
+}
+
+function normalizeHex(value, fallback) {
+  if (typeof value !== 'string') return fallback;
+  const v = value.trim();
+  return /^#[0-9a-fA-F]{6}$/.test(v) ? v : fallback;
+}
+
+async function callGroq(endpoint, payload, env, timeoutMs) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   let res;
   try {
@@ -162,31 +379,7 @@ async function searchWithGroqCompound(query, maxResults, country, env) {
     throw new Error('Groq API 응답 실패: HTTP ' + res.status + ' ' + errBody.slice(0, 300));
   }
 
-  const data = await res.json();
-  const message = data && data.choices && data.choices[0] && data.choices[0].message
-    ? data.choices[0].message
-    : {};
-
-  const summary = message.content || '';
-
-  // executed_tools[].search_results.results 에 원본 검색 결과가 들어있다.
-  let rawResults = [];
-  if (Array.isArray(message.executed_tools)) {
-    for (const tool of message.executed_tools) {
-      if (tool && tool.search_results && Array.isArray(tool.search_results.results)) {
-        rawResults = rawResults.concat(tool.search_results.results);
-      }
-    }
-  }
-
-  const results = rawResults.slice(0, maxResults).map((r) => ({
-    title: r.title || '',
-    url: r.url || '',
-    content: r.content || '',
-    score: typeof r.score === 'number' ? r.score : null,
-  }));
-
-  return { summary, results };
+  return res.json();
 }
 
 /* ── 공통 유틸 ── */
